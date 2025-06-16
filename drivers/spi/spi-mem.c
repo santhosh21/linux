@@ -556,6 +556,18 @@ int spi_mem_adjust_op_size(struct spi_mem *mem, struct spi_mem_op *op)
 }
 EXPORT_SYMBOL_GPL(spi_mem_adjust_op_size);
 
+int spi_mem_do_calibration(struct spi_mem *mem, const struct spi_mem_op *op)
+{
+	struct spi_controller *ctlr = mem->spi->controller;
+
+	if (!ctlr->mem_ops || !ctlr->mem_ops->do_calibration)
+		return -EOPNOTSUPP;
+
+	ctlr->mem_ops->do_calibration(mem, op);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(spi_mem_do_calibration);
+
 /**
  * spi_mem_adjust_op_freq() - Adjust the frequency of a SPI mem operation to
  *			      match controller, PCB and chip limitations
