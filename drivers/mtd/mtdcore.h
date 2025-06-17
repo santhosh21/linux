@@ -13,6 +13,7 @@ int del_mtd_device(struct mtd_info *mtd);
 int add_mtd_partitions(struct mtd_info *, const struct mtd_partition *, int);
 int del_mtd_partitions(struct mtd_info *);
 void release_mtd_partition(struct mtd_info *mtd);
+int mtd_execute_tuning(struct mtd_info *mtd);
 
 struct mtd_partitions;
 
