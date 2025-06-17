@@ -1483,6 +1483,66 @@ static void spinand_mtd_resume(struct mtd_info *mtd)
 	spinand_ecc_enable(spinand, false);
 }
 
+static int spinand_mtd_execute_tuning(struct mtd_info *mtd, struct mtd_part *part)
+{
+	struct spinand_device *spinand = mtd_to_spinand(mtd);
+	struct nand_device *nand = spinand_to_nand(spinand);
+	struct nand_pos page_pos;
+	struct nand_page_io_req page_req;
+	struct spi_mem_op read_page_op;
+	struct spi_mem_tuning_params *tuning_params;
+	int ret, pageoffs;
+	u8 status;
+
+	tuning_params = kzalloc(sizeof(*tuning_params), GFP_KERNEL);
+	if (!tuning_params)
+		return -ENOMEM;
+
+	ret = spi_mem_get_tuning_params(spinand->spimem, tuning_params);
+	if (ret)
+		goto err_free_tuning_params;
+
+	/*
+	 * TODO:
+	 * Write the PHY pattern to cache using spinand_write_to_cache_op()
+	 * and readback pattern from cache during tuning instead of using up
+	 * the flash's space.
+	 *
+	 * For SPI NOR:
+	 * Things remain same as done here, the PHY pattern will be preflashed to
+	 * at an offset and will be readback during tuning.
+	 */
+
+	pageoffs = nanddev_offs_to_pos(nand, part->offset, &page_pos);
+	page_req.pos = page_pos;
+
+	read_page_op = *spinand->op_templates.read_cache;
+	read_page_op.addr.val = pageoffs;
+	read_page_op.data.nbytes = tuning_params->pattern_size;
+
+	ret = spinand_load_page_op(spinand, &page_req);
+	if (ret)
+		goto err_free_tuning_params;
+
+	ret = spinand_wait(spinand, SPINAND_READ_INITIAL_DELAY_US,
+			   SPINAND_READ_POLL_DELAY_US, &status);
+	if (ret < 0)
+		goto err_free_tuning_params;
+
+	spinand_ondie_ecc_save_status(nand, status);
+	ret = spi_mem_execute_tuning(spinand->spimem, &read_page_op);
+
+	/*
+	 * TODO:
+	 * Fallback to a lower frequency and a less dummy cycle in case of
+	 * PHY tuning failure
+	 */
+
+err_free_tuning_params:
+	kfree(tuning_params);
+	return ret;
+}
+
 static int spinand_init(struct spinand_device *spinand)
 {
 	struct device *dev = &spinand->spimem->spi->dev;
@@ -1551,6 +1611,7 @@ static int spinand_init(struct spinand_device *spinand)
 	mtd->_erase = spinand_mtd_erase;
 	mtd->_max_bad_blocks = nanddev_mtd_max_bad_blocks;
 	mtd->_resume = spinand_mtd_resume;
+	mtd->_execute_tuning = spinand_mtd_execute_tuning;
 
 	if (spinand_user_otp_size(spinand) || spinand_fact_otp_size(spinand)) {
 		ret = spinand_set_mtd_otp_ops(spinand);
