@@ -355,6 +355,7 @@ struct mtd_info {
 	int (*_suspend) (struct mtd_info *mtd);
 	void (*_resume) (struct mtd_info *mtd);
 	void (*_reboot) (struct mtd_info *mtd);
+	int (*_calibrate) (struct mtd_info *mtd, struct mtd_part *part);
 	/*
 	 * If the driver is something smart, like UBI, it may need to maintain
 	 * its own reference counting. The below functions are only for driver.

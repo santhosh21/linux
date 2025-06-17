@@ -9,6 +9,8 @@
 
 #define pr_fmt(fmt)	"spi-nand: " fmt
 
+#define PHY_PATTERN_SIZE	0x80
+
 #include <linux/device.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
@@ -1475,6 +1477,38 @@ static void spinand_mtd_resume(struct mtd_info *mtd)
 	spinand_ecc_enable(spinand, false);
 }
 
+static int spinand_mtd_calibrate(struct mtd_info *mtd, struct mtd_part *part)
+{
+	struct spinand_device *spinand = mtd_to_spinand(mtd);
+	struct nand_device *nand = spinand_to_nand(spinand);
+	struct nand_pos page_pos;
+	struct nand_page_io_req page_req;
+	struct spi_mem_op read_page_op;
+	int ret, pageoffs;
+	u8 status;
+
+	pageoffs = nanddev_offs_to_pos(nand, part->offset, &page_pos);
+	page_req.pos = page_pos;
+
+	read_page_op = *spinand->op_templates.read_cache;
+	read_page_op.addr.val = pageoffs;
+	read_page_op.data.nbytes = PHY_PATTERN_SIZE;
+
+	ret = spinand_load_page_op(spinand, &page_req);
+	if (ret)
+		return ret;
+
+	ret = spinand_wait(spinand, SPINAND_READ_INITIAL_DELAY_US,
+			   SPINAND_READ_POLL_DELAY_US, &status);
+	if (ret < 0)
+		return ret;
+
+	spinand_ondie_ecc_save_status(nand, status);
+	spi_mem_do_calibration(spinand->spimem, &read_page_op);
+
+	return 0;
+}
+
 static int spinand_init(struct spinand_device *spinand)
 {
 	struct device *dev = &spinand->spimem->spi->dev;
@@ -1543,6 +1577,7 @@ static int spinand_init(struct spinand_device *spinand)
 	mtd->_erase = spinand_mtd_erase;
 	mtd->_max_bad_blocks = nanddev_mtd_max_bad_blocks;
 	mtd->_resume = spinand_mtd_resume;
+	mtd->_calibrate = spinand_mtd_calibrate;
 
 	if (spinand_user_otp_size(spinand) || spinand_fact_otp_size(spinand)) {
 		ret = spinand_set_mtd_otp_ops(spinand);
