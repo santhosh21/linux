@@ -1073,6 +1073,22 @@ err:
 	return dev_err_probe(dev, err, "Failed to register OTP NVMEM device\n");
 }
 
+int mtd_calibrate(struct mtd_info *mtd)
+{
+	struct mtd_part *part;
+
+	list_for_each_entry(part, &mtd->partitions, node) {
+		struct mtd_info *part_info =
+			container_of(part, struct mtd_info, part);
+		if (part_info->name &&
+		    !strcmp(part_info->name, "ospi_nand.phypattern")) {
+			return mtd->_calibrate(mtd, part);
+		}
+	}
+
+	return -ENODEV;
+}
+
 /**
  * mtd_device_parse_register - parse partitions and register an MTD device.
  *
@@ -1142,6 +1158,8 @@ int mtd_device_parse_register(struct mtd_info *mtd, const char * const *types,
 
 	if (ret)
 		goto out;
+
+	mtd_calibrate(mtd);
 
 	/*
 	 * FIXME: some drivers unfortunately call this function more than once.
