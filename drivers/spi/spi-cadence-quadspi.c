@@ -2170,6 +2170,14 @@ static int cqspi_mem_execute_tuning(struct spi_mem *mem,
 	return ret;
 }
 
+static int cqspi_get_tuning_params(struct spi_mem *mem,
+				   struct spi_mem_tuning_params *tuning_params)
+{
+	tuning_params->pattern_ptr = phy_tuning_pattern;
+	tuning_params->pattern_size = sizeof(phy_tuning_pattern);
+	return 0;
+}
+
 static int cqspi_of_get_flash_pdata(struct platform_device *pdev,
 				    struct cqspi_flash_pdata *f_pdata,
 				    struct device_node *np)
@@ -2345,6 +2353,7 @@ static const struct spi_controller_mem_ops cqspi_mem_ops = {
 	.get_name = cqspi_get_name,
 	.supports_op = cqspi_supports_mem_op,
 	.execute_tuning = cqspi_mem_execute_tuning,
+	.get_tuning_params = cqspi_get_tuning_params,
 };
 
 static const struct spi_controller_mem_caps cqspi_mem_caps = {
