@@ -570,6 +570,17 @@ int spi_mem_execute_tuning(struct spi_mem *mem, const struct spi_mem_op *op)
 }
 EXPORT_SYMBOL_GPL(spi_mem_execute_tuning);
 
+int spi_mem_get_tuning_params(struct spi_mem *mem, struct spi_mem_tuning_params *tuning_params)
+{
+	struct spi_controller *ctlr = mem->spi->controller;
+
+	if (!ctlr->mem_ops || !ctlr->mem_ops->get_tuning_params)
+		return -EOPNOTSUPP;
+
+	return ctlr->mem_ops->get_tuning_params(mem, tuning_params);
+}
+EXPORT_SYMBOL_GPL(spi_mem_get_tuning_params);
+
 /**
  * spi_mem_adjust_op_freq() - Adjust the frequency of a SPI mem operation to
  *			      match controller, PCB and chip limitations

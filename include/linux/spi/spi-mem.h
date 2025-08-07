@@ -239,6 +239,16 @@ struct spi_mem_dirmap_desc {
 };
 
 /**
+ * struct spi_mem_tuning_params - describes the Tuning parameters
+ * @pattern_ptr: pointer to the tuning pattern
+ * @pattern_size: size of the tuning pattern
+ */
+struct spi_mem_tuning_params {
+	u8 *pattern_ptr;
+	unsigned int pattern_size;
+};
+
+/**
  * struct spi_mem - describes a SPI memory device
  * @spi: the underlying SPI device
  * @drvpriv: spi_mem_driver private data
@@ -352,6 +362,8 @@ struct spi_controller_mem_ops {
 			   unsigned long timeout_ms);
 	int (*execute_tuning)(struct spi_mem *mem,
 			      const struct spi_mem_op *op);
+	int (*get_tuning_params)(struct spi_mem *mem,
+				 struct spi_mem_tuning_params *tuning_params);
 };
 
 /**
@@ -434,6 +446,8 @@ int spi_mem_adjust_op_size(struct spi_mem *mem, struct spi_mem_op *op);
 int spi_mem_execute_tuning(struct spi_mem *mem, const struct spi_mem_op *op);
 void spi_mem_adjust_op_freq(struct spi_mem *mem, struct spi_mem_op *op);
 u64 spi_mem_calc_op_duration(struct spi_mem *mem, struct spi_mem_op *op);
+int spi_mem_get_tuning_params(struct spi_mem *mem,
+			      struct spi_mem_tuning_params *tuning_params);
 
 bool spi_mem_supports_op(struct spi_mem *mem,
 			 const struct spi_mem_op *op);
