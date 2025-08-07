@@ -180,7 +180,7 @@ struct cqspi_driver_platdata {
 #define CQSPI_REG_DELAY_TSHSL_MASK		0xFF
 
 #define CQSPI_REG_READCAPTURE			0x10
-#define CQSPI_REG_READCAPTURE_BYPASS_LSB	0
+#define CQSPI_REG_READCAPTURE_BYPASS		BIT(0)
 #define CQSPI_REG_READCAPTURE_DELAY_LSB		1
 #define CQSPI_REG_READCAPTURE_DELAY_MASK	0xF
 
@@ -453,10 +453,15 @@ static void cqspi_readdata_capture(struct cqspi_st *cqspi,
 
 	reg = readl(reg_base + CQSPI_REG_READCAPTURE);
 
+	/*
+	 * Bypass bit - to enable/disable the signal from adapted loopback
+	 * clock circuit which is driven into Rx DLL and is used for data
+	 * capturing rather than internally generated ref_clk.
+	 */
 	if (bypass)
-		reg |= (1 << CQSPI_REG_READCAPTURE_BYPASS_LSB);
+		reg |= CQSPI_REG_READCAPTURE_BYPASS;
 	else
-		reg &= ~(1 << CQSPI_REG_READCAPTURE_BYPASS_LSB);
+		reg &= ~CQSPI_REG_READCAPTURE_BYPASS;
 
 	reg &= ~(CQSPI_REG_READCAPTURE_DELAY_MASK
 		 << CQSPI_REG_READCAPTURE_DELAY_LSB);
