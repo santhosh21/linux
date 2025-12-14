@@ -72,6 +72,7 @@ struct cqspi_flash_pdata {
 	u32		tsd2d_ns;
 	u32		tchsh_ns;
 	u32		tslch_ns;
+	bool		has_dqs;
 	u8		cs;
 };
 
@@ -1586,6 +1587,8 @@ static int cqspi_of_get_flash_pdata(struct platform_device *pdev,
 		dev_err(&pdev->dev, "couldn't determine spi-max-frequency\n");
 		return -ENXIO;
 	}
+
+	f_pdata->has_dqs = of_property_read_bool(np, "spi-has-dqs");
 
 	return 0;
 }
