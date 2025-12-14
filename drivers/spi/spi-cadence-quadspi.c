@@ -32,6 +32,7 @@
 
 #define CQSPI_NAME			"cadence-qspi"
 #define CQSPI_MAX_CHIPSELECT		4
+#define CQSPI_AM654_NON_PHY_CLK_RATE	25000000
 
 static_assert(CQSPI_MAX_CHIPSELECT <= SPI_DEVICE_CS_CNT_MAX);
 
@@ -67,6 +68,7 @@ struct cqspi_st;
 struct cqspi_flash_pdata {
 	struct cqspi_st	*cqspi;
 	u32		clk_rate;
+	u32		non_phy_clk_rate;
 	u32		read_delay;
 	u32		tshsl_ns;
 	u32		tsd2d_ns;
@@ -74,6 +76,8 @@ struct cqspi_flash_pdata {
 	u32		tslch_ns;
 	bool		has_dqs;
 	u8		cs;
+	struct spi_mem_op	phy_read_op;
+	struct spi_mem_op	phy_write_op;
 };
 
 struct cqspi_st {
@@ -126,6 +130,9 @@ struct cqspi_driver_platdata {
 	u32 (*get_dma_status)(struct cqspi_st *cqspi);
 	int (*jh7110_clk_init)(struct platform_device *pdev,
 			       struct cqspi_st *cqspi);
+	int (*execute_tuning)(struct spi_mem *mem, struct spi_mem_op *read_op,
+			      struct spi_mem_op *write_op);
+	u32 (*get_non_phy_clk_rate)(struct cqspi_st *cqspi);
 };
 
 /* Operation timeout value */
@@ -317,6 +324,25 @@ struct cqspi_driver_platdata {
 #define CQSPI_DMA_UNALIGN		0x3
 
 #define CQSPI_REG_VERSAL_DMA_VAL		0x602
+
+/*
+ * PHY tuning pattern for calibrating read data capture delay. This 128-byte
+ * pattern provides sufficient bit transitions across all byte lanes to
+ * reliably detect timing windows at high frequencies.
+ */
+static const u8 phy_tuning_pattern[] __aligned(64) = {
+	0xFE, 0xFF, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0xFE, 0xFE, 0x01,
+	0x01, 0x01, 0x01, 0x00, 0x00, 0xFE, 0xFE, 0x01, 0xFF, 0xFF, 0xFF, 0xFF,
+	0xFF, 0x00, 0x00, 0xFE, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0xFE,
+	0xFE, 0xFF, 0x01, 0x01, 0x01, 0x01, 0x01, 0xFE, 0x00, 0xFE, 0xFE, 0x01,
+	0x01, 0x01, 0x01, 0xFE, 0x00, 0xFE, 0xFE, 0x01, 0xFF, 0xFF, 0xFF, 0xFF,
+	0xFF, 0xFE, 0x00, 0xFE, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE, 0x00, 0xFE,
+	0xFE, 0xFF, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0xFE, 0xFE, 0xFE, 0x01,
+	0x01, 0x01, 0x01, 0x00, 0xFE, 0xFE, 0xFE, 0x01, 0xFF, 0xFF, 0xFF, 0xFF,
+	0xFF, 0x00, 0xFE, 0xFE, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFE, 0xFE,
+	0xFE, 0xFF, 0x01, 0x01, 0x01, 0x01, 0x01, 0xFE, 0xFE, 0xFE, 0xFE, 0x01,
+	0x01, 0x01, 0x01, 0xFE, 0xFE, 0xFE, 0xFE, 0x01,
+};
 
 static int cqspi_wait_for_bit(const struct cqspi_driver_platdata *ddata,
 			      void __iomem *reg, const u32 mask, bool clr,
@@ -1554,6 +1580,214 @@ static bool cqspi_supports_mem_op(struct spi_mem *mem,
 	return spi_mem_default_supports_op(mem, op);
 }
 
+static int cqspi_write_pattern_to_cache(struct cqspi_flash_pdata *f_pdata,
+					struct spi_mem *mem,
+					struct spi_mem_op *write_op)
+{
+	struct device *dev = &f_pdata->cqspi->pdev->dev;
+	int ret;
+
+	write_op->data.nbytes = sizeof(phy_tuning_pattern);
+	write_op->data.buf.out = phy_tuning_pattern;
+
+	ret = spi_mem_exec_op(mem, write_op);
+	if (ret) {
+		dev_err(dev, "Failed to write PHY pattern to cache: %d\n", ret);
+		return ret;
+	}
+	dev_dbg(dev, "PHY pattern (%zu bytes) written to cache\n",
+		sizeof(phy_tuning_pattern));
+
+	return 0;
+}
+
+static int cqspi_get_phy_pattern_offset(struct device *dev, u32 *offset)
+{
+	struct device_node *np, *flash_np = NULL;
+	struct device_node *partition_np, *part_np;
+	const char *label;
+	const __be32 *reg;
+	int len;
+
+	if (!dev || !dev->of_node)
+		return -EINVAL;
+
+	for_each_child_of_node(dev->of_node, np) {
+		if (of_node_name_prefix(np, "flash")) {
+			flash_np = np;
+			break;
+		}
+	}
+
+	if (!flash_np)
+		return -ENODEV;
+
+	partition_np = of_get_child_by_name(flash_np, "partitions");
+	if (!partition_np) {
+		of_node_put(flash_np);
+		return -ENODEV;
+	}
+
+	for_each_child_of_node(partition_np, part_np) {
+		if (of_property_read_string(part_np, "label", &label) ||
+		    !strstr(label, "phypattern"))
+			continue;
+
+		reg = of_get_property(part_np, "reg", &len);
+		if (reg && len >= sizeof(__be32)) {
+			*offset = be32_to_cpu(reg[0]);
+			of_node_put(part_np);
+			of_node_put(partition_np);
+			of_node_put(flash_np);
+			return 0;
+		}
+	}
+
+	of_node_put(partition_np);
+	of_node_put(flash_np);
+	return -ENOENT;
+}
+
+static int cqspi_phy_check_pattern(struct cqspi_flash_pdata *f_pdata,
+				   struct spi_mem *mem)
+{
+	struct spi_mem_op op;
+	u8 *read_data;
+	int ret;
+
+	read_data = kmalloc_array(1, sizeof(phy_tuning_pattern), GFP_KERNEL);
+	if (!read_data)
+		return -ENOMEM;
+
+	op = f_pdata->phy_read_op;
+	op.data.buf.in = read_data;
+	op.data.nbytes = sizeof(phy_tuning_pattern);
+
+	ret = spi_mem_exec_op(mem, &op);
+	if (ret)
+		goto out;
+
+	if (memcmp(read_data, phy_tuning_pattern, sizeof(phy_tuning_pattern)))
+		ret = -EAGAIN;
+
+out:
+	kfree(read_data);
+	return ret;
+}
+
+static void cqspi_phy_pre_config(struct cqspi_st *cqspi,
+				 struct cqspi_flash_pdata *f_pdata,
+				 const bool bypass)
+{
+	/* Placeholder for PHY pre-configuration */
+}
+
+static void cqspi_phy_post_config(struct cqspi_st *cqspi,
+				  const unsigned int delay)
+{
+	/* Placeholder for PHY post-configuration */
+}
+
+static int cqspi_phy_tuning_ddr(struct cqspi_flash_pdata *f_pdata,
+				struct spi_mem *mem)
+{
+	/* Placeholder for DDR mode PHY tuning algorithm */
+	return 0;
+}
+
+static int cqspi_phy_tuning_sdr(struct cqspi_flash_pdata *f_pdata,
+				struct spi_mem *mem)
+{
+	/* Placeholder for SDR mode PHY tuning algorithm */
+	return 0;
+}
+
+static int cqspi_am654_ospi_execute_tuning(struct spi_mem *mem,
+					   struct spi_mem_op *read_op,
+					   struct spi_mem_op *write_op)
+{
+	struct cqspi_st *cqspi =
+		spi_controller_get_devdata(mem->spi->controller);
+	struct cqspi_flash_pdata *f_pdata;
+	struct device *dev = &cqspi->pdev->dev;
+	int ret;
+	u32 phy_offset;
+
+	f_pdata = &cqspi->f_pdata[spi_get_chipselect(mem->spi, 0)];
+
+	if (read_op->max_freq <= f_pdata->non_phy_clk_rate) {
+		dev_dbg(dev,
+			"Frequency %u Hz below PHY threshold %u Hz, skipping tuning\n",
+			read_op->max_freq, f_pdata->non_phy_clk_rate);
+		return 0;
+	}
+
+	if (write_op) {
+		ret = cqspi_write_pattern_to_cache(f_pdata, mem, write_op);
+		if (ret) {
+			dev_warn(dev,
+				 "failed to write pattern to cache: %d, skipping PHY tuning\n",
+				 ret);
+			return ret;
+		}
+
+		f_pdata->phy_write_op = *write_op;
+	} else {
+		ret = cqspi_get_phy_pattern_offset(dev, &phy_offset);
+		if (ret) {
+			dev_warn(dev,
+				 "PHY pattern partition not found: %d, skipping PHY tuning\n",
+				 ret);
+			return ret;
+		}
+
+		read_op->addr.val = phy_offset;
+	}
+
+	f_pdata->phy_read_op = *read_op;
+
+	ret = cqspi_phy_check_pattern(f_pdata, mem);
+	if (ret) {
+		dev_err(dev, "PHY pattern not found: %d, skipping PHY tuning\n",
+			ret);
+		return ret;
+	}
+
+	if (read_op->cmd.dtr || read_op->addr.dtr || read_op->dummy.dtr ||
+	    read_op->data.dtr) {
+		cqspi_phy_pre_config(cqspi, f_pdata, false);
+		ret = cqspi_phy_tuning_ddr(f_pdata, mem);
+	} else {
+		cqspi_phy_pre_config(cqspi, f_pdata, true);
+		ret = cqspi_phy_tuning_sdr(f_pdata, mem);
+	}
+
+	if (ret)
+		dev_warn(dev, "PHY tuning failed: %d\n", ret);
+
+	cqspi_phy_post_config(cqspi, f_pdata->read_delay);
+
+	return ret;
+}
+
+static u32 cqspi_am654_ospi_get_non_phy_clk_rate(struct cqspi_st *cqspi)
+{
+	return CQSPI_AM654_NON_PHY_CLK_RATE;
+}
+
+static int cqspi_mem_op_execute_tuning(struct spi_mem *mem,
+				       struct spi_mem_op *read_op,
+				       struct spi_mem_op *write_op)
+{
+	struct cqspi_st *cqspi =
+		spi_controller_get_devdata(mem->spi->controller);
+
+	if (!cqspi->ddata->execute_tuning)
+		return -EOPNOTSUPP;
+
+	return cqspi->ddata->execute_tuning(mem, read_op, write_op);
+}
+
 static int cqspi_of_get_flash_pdata(struct platform_device *pdev,
 				    struct cqspi_flash_pdata *f_pdata,
 				    struct device_node *np)
@@ -1587,6 +1821,10 @@ static int cqspi_of_get_flash_pdata(struct platform_device *pdev,
 		dev_err(&pdev->dev, "couldn't determine spi-max-frequency\n");
 		return -ENXIO;
 	}
+
+	if (f_pdata->cqspi->ddata->get_non_phy_clk_rate)
+		f_pdata->non_phy_clk_rate =
+			f_pdata->cqspi->ddata->get_non_phy_clk_rate(f_pdata->cqspi);
 
 	f_pdata->has_dqs = of_property_read_bool(np, "spi-has-dqs");
 
@@ -1732,6 +1970,7 @@ static const struct spi_controller_mem_ops cqspi_mem_ops = {
 	.exec_op = cqspi_exec_mem_op,
 	.get_name = cqspi_get_name,
 	.supports_op = cqspi_supports_mem_op,
+	.execute_tuning = cqspi_mem_op_execute_tuning,
 };
 
 static const struct spi_controller_mem_caps cqspi_mem_caps = {
@@ -2151,6 +2390,8 @@ static const struct cqspi_driver_platdata k2g_qspi = {
 static const struct cqspi_driver_platdata am654_ospi = {
 	.hwcaps_mask = CQSPI_SUPPORTS_OCTAL | CQSPI_SUPPORTS_QUAD,
 	.quirks = CQSPI_NEEDS_WR_DELAY,
+	.execute_tuning = cqspi_am654_ospi_execute_tuning,
+	.get_non_phy_clk_rate = cqspi_am654_ospi_get_non_phy_clk_rate,
 };
 
 static const struct cqspi_driver_platdata intel_lgm_qspi = {
