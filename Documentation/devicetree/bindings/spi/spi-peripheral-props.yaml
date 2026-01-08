@@ -89,6 +89,12 @@ properties:
     description:
       Delay, in microseconds, after a write transfer.
 
+  spi-has-dqs:
+    description:
+      Indicates the SPI flash device supports DQS (Data Strobe) mode for
+      improved data capture timing.
+    $ref: /schemas/types.yaml#/definitions/flag
+
   stacked-memories:
     description: Several SPI memories can be wired in stacked mode.
       This basically means that either a device features several chip
