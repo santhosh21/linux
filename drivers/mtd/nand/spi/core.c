@@ -2050,6 +2050,41 @@ static int spinand_probe(struct spi_mem *mem)
 	if (ret)
 		return ret;
 
+	/*
+	 * Copy the read and write op templates into persistent fields so
+	 * execute_tuning can write the validated frequency back into them.
+	 * Tuning failure is non-fatal; the device operates at base speed.
+	 */
+	spinand->max_read_op = *spinand->op_templates->read_cache;
+	spinand->max_write_op = *spinand->op_templates->write_cache;
+
+	ret = spi_mem_execute_tuning(mem, &spinand->max_read_op,
+				     &spinand->max_write_op);
+	if (ret && ret != -EOPNOTSUPP)
+		dev_warn(&mem->spi->dev, "Failed to execute PHY tuning: %d\n",
+			 ret);
+
+	/*
+	 * Dirmaps were set up in spinand_init() before tuning ran; update
+	 * their op templates to use the validated frequency.
+	 */
+	if (!ret) {
+		struct nand_device *nand = spinand_to_nand(spinand);
+		int i;
+
+		for (i = 0; i < nand->memorg.planes_per_lun; i++) {
+			if (spinand->dirmaps[i].rdesc) {
+				spinand->dirmaps[i].rdesc->info.primary_op_tmpl.max_freq =
+					spinand->max_read_op.max_freq;
+				spinand->dirmaps[i].rdesc->info.secondary_op_tmpl.max_freq =
+					spinand->max_read_op.max_freq;
+			}
+			if (spinand->dirmaps[i].wdesc)
+				spinand->dirmaps[i].wdesc->info.primary_op_tmpl.max_freq =
+					spinand->max_write_op.max_freq;
+		}
+	}
+
 	ret = mtd_device_register(mtd, NULL, 0);
 	if (ret)
 		goto err_spinand_cleanup;
