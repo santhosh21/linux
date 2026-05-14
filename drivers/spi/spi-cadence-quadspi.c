@@ -49,6 +49,7 @@ static_assert(CQSPI_MAX_CHIPSELECT <= SPI_DEVICE_CS_CNT_MAX);
 #define CQSPI_DISABLE_RUNTIME_PM	BIT(10)
 #define CQSPI_NO_INDIRECT_MODE		BIT(11)
 #define CQSPI_HAS_WR_PROTECT		BIT(12)
+#define CQSPI_NO_2BYTE_ADDR_PHY_DDR	BIT(13)
 
 /* Capabilities */
 #define CQSPI_SUPPORTS_OCTAL		BIT(0)
@@ -1626,6 +1627,18 @@ static bool cqspi_supports_mem_op(struct spi_mem *mem,
 			return false;
 		if (op->data.nbytes && op->data.buswidth != 8)
 			return false;
+
+		/*
+		 * Erratum i2383: In PHY DDR mode, 2-byte addressing causes an
+		 * internal state machine to mis-compare the transmitted
+		 * address byte count against 1 instead of 2, locking up the
+		 * address phase. Reject such ops on controllers that need it.
+		 */
+		if (cqspi->ddata &&
+		    (cqspi->ddata->quirks & CQSPI_NO_2BYTE_ADDR_PHY_DDR)) {
+			if (op->addr.nbytes == 2 && cqspi->ddata->execute_tuning)
+				return false;
+		}
 
 		if (cqspi->is_rzn1)
 			return false;
@@ -3882,7 +3895,7 @@ static const struct cqspi_driver_platdata k2g_qspi = {
 
 static const struct cqspi_driver_platdata am654_ospi = {
 	.hwcaps_mask = CQSPI_SUPPORTS_OCTAL | CQSPI_SUPPORTS_QUAD,
-	.quirks = CQSPI_NEEDS_WR_DELAY,
+	.quirks = CQSPI_NEEDS_WR_DELAY | CQSPI_NO_2BYTE_ADDR_PHY_DDR,
 	.execute_tuning = cqspi_am654_ospi_execute_tuning,
 };
 
