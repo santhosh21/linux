@@ -41,9 +41,15 @@ properties:
       The device requires the LSB first mode.
 
   spi-max-frequency:
-    $ref: /schemas/types.yaml#/definitions/uint32
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 2
     description:
-      Maximum SPI clocking speed of the device in Hz.
+      SPI clocking speed of the device in Hz. Either a single maximum
+      frequency, or two values [base-frequency, max-frequency] where
+      base-frequency is the conservative speed and max-frequency is the
+      highest speed the device supports after controller-side configurations
+      such as data training.
 
   spi-cs-setup-delay-ns:
     description:
