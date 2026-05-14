@@ -398,7 +398,11 @@ int spi_mem_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
 	u8 *tmpbuf;
 	int ret;
 
-	/* Make sure the operation frequency is correct before going futher */
+	/*
+	 * Ops not configured for maximum speed are limited to the conservative
+	 * base speed; spi_mem_adjust_op_freq() then caps to the device maximum.
+	 */
+	spi_mem_apply_base_freq_cap(mem, (struct spi_mem_op *)op);
 	spi_mem_adjust_op_freq(mem, (struct spi_mem_op *)op);
 
 	dev_vdbg(&mem->spi->dev, "[cmd: 0x%02x][%dB addr: %#8llx][%2dB dummy][%4dB data %s] %d%c-%d%c-%d%c-%d%c @ %uHz\n",
@@ -598,6 +602,26 @@ void spi_mem_adjust_op_freq(struct spi_mem *mem, struct spi_mem_op *op)
 		op->max_freq = mem->spi->max_speed_hz;
 }
 EXPORT_SYMBOL_GPL(spi_mem_adjust_op_freq);
+
+/**
+ * spi_mem_apply_base_freq_cap() - Enforce the conservative base speed for
+ *				   operations that are not explicitly validated
+ * @mem: the SPI memory
+ * @op: the operation to adjust
+ *
+ * When @mem->spi->base_speed_hz is non-zero, caps @op->max_freq to that
+ * value unless @op->max_freq is already set to @mem->spi->max_speed_hz,
+ * which signals the operation has been configured for max-speed use.
+ */
+void spi_mem_apply_base_freq_cap(struct spi_mem *mem, struct spi_mem_op *op)
+{
+	if (!mem->spi->base_speed_hz || op->max_freq == mem->spi->max_speed_hz)
+		return;
+
+	if (!op->max_freq || op->max_freq > mem->spi->base_speed_hz)
+		op->max_freq = mem->spi->base_speed_hz;
+}
+EXPORT_SYMBOL_GPL(spi_mem_apply_base_freq_cap);
 
 /**
  * spi_mem_calc_op_duration() - Derives the theoretical length (in ns) of an
