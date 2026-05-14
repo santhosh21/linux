@@ -216,6 +216,9 @@ static struct spi_mem_op spi_nor_spimem_get_read_op(struct spi_nor *nor)
 	if (spi_nor_protocol_is_dtr(nor->read_proto))
 		op.dummy.nbytes *= 2;
 
+	/* Propagate the validated frequency; zero before tuning. */
+	op.max_freq = nor->max_read_op.max_freq;
+
 	return op;
 }
 
@@ -3843,6 +3846,9 @@ static int spi_nor_probe(struct spi_mem *spimem)
 			return -ENOMEM;
 	}
 
+	/* Populate the persistent template with the correct op layout for tuning. */
+	nor->max_read_op = spi_nor_spimem_get_read_op(nor);
+
 	ret = spi_nor_create_read_dirmap(nor);
 	if (ret)
 		return ret;
@@ -3850,6 +3856,19 @@ static int spi_nor_probe(struct spi_mem *spimem)
 	ret = spi_nor_create_write_dirmap(nor);
 	if (ret)
 		return ret;
+
+	/* Tuning failure is non-fatal; the device operates at base speed. */
+	ret = spi_mem_execute_tuning(spimem, &nor->max_read_op, NULL);
+	if (ret && ret != -EOPNOTSUPP)
+		dev_warn(dev, "Failed to execute PHY tuning: %d\n", ret);
+
+	/*
+	 * The dirmap was created before tuning ran; update its op template
+	 * to use the validated frequency.
+	 */
+	if (!ret && nor->dirmap.rdesc)
+		nor->dirmap.rdesc->info.primary_op_tmpl.max_freq =
+			nor->max_read_op.max_freq;
 
 	return mtd_device_register(&nor->mtd, data ? data->parts : NULL,
 				   data ? data->nr_parts : 0);
