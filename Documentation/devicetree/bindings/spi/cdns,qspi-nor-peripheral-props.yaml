@@ -39,4 +39,12 @@ properties:
       Delay in nanoseconds between setting qspi_n_ss_out low and
       first bit transfer.
 
+  cdns,phy-pattern-partition:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      Phandle to the flash partition containing the PHY tuning pattern.
+      When present, the controller uses this partition to locate the
+      pattern data during PHY tuning instead of searching all partitions
+      by label.
+
 additionalProperties: true
