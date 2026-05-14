@@ -2364,7 +2364,7 @@ static int of_spi_parse_dt(struct spi_controller *ctlr, struct spi_device *spi,
 			   struct device_node *nc)
 {
 	u32 value, cs[SPI_DEVICE_CS_CNT_MAX], map[SPI_DEVICE_DATA_LANE_CNT_MAX];
-	int rc, idx, max_num_data_lanes;
+	int rc, idx, max_num_data_lanes, nfreq;
 
 	/* Mode (clock phase/polarity/etc.) */
 	if (of_property_read_bool(nc, "spi-cpha"))
@@ -2596,9 +2596,20 @@ static int of_spi_parse_dt(struct spi_controller *ctlr, struct spi_device *spi,
 	 */
 	spi->cs_index_mask = BIT(0);
 
-	/* Device speed */
-	if (!of_property_read_u32(nc, "spi-max-frequency", &value))
+	/*
+	 * Device speed: a single value sets max_speed_hz; two values set
+	 * base_speed_hz (conservative) and max_speed_hz (maximum after
+	 * controller-side configuration).
+	 */
+	nfreq = of_property_count_u32_elems(nc, "spi-max-frequency");
+	if (nfreq == 2) {
+		of_property_read_u32_index(nc, "spi-max-frequency", 0,
+					   &spi->base_speed_hz);
+		of_property_read_u32_index(nc, "spi-max-frequency", 1,
+					   &spi->max_speed_hz);
+	} else if (!of_property_read_u32(nc, "spi-max-frequency", &value)) {
 		spi->max_speed_hz = value;
+	}
 
 	/* Device CS delays */
 	of_spi_parse_dt_cs_delay(nc, &spi->cs_setup, "spi-cs-setup-delay-ns");
