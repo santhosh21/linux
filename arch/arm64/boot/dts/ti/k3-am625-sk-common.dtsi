@@ -244,11 +244,13 @@
 		spi-tx-bus-width = <8>;
 		spi-rx-bus-width = <8>;
 		spi-max-frequency = <25000000>;
+		spi-max-post-config-frequency-hz = <166000000>;
 		cdns,tshsl-ns = <60>;
 		cdns,tsd2d-ns = <60>;
 		cdns,tchsh-ns = <60>;
 		cdns,tslch-ns = <60>;
 		cdns,read-delay = <4>;
+		spi-phy-pattern-partition = <&phy_pattern>;
 
 		partitions {
 			compatible = "fixed-partitions";
@@ -286,7 +288,7 @@
 				reg = <0x800000 0x37c0000>;
 			};
 
-			partition@3fc0000 {
+			phy_pattern: partition@3fc0000 {
 				bootph-pre-ram;
 				label = "ospi.phypattern";
 				reg = <0x3fc0000 0x40000>;
