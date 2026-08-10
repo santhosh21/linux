@@ -792,7 +792,21 @@ struct spinand_device {
 	struct spinand_mem_ops *op_templates;
 	enum spinand_bus_interface bus_iface;
 
+	/*
+	 * Full read variant list (ODTR and SSDR ops together), saved when ODTR
+	 * templates are valid. Used by spinand_optimize_controller() for ranked
+	 * fallback when the pre-selected variant cannot be controller-optimized.
+	 */
+	const struct spinand_op_variants *all_read_variants;
+
+	/* Continuous-read counterpart of all_read_variants, if any. */
+	const struct spinand_op_variants *all_cont_read_variants;
+
 	struct spinand_dirmap *dirmaps;
+
+	/* Persistent op templates updated by execute_tuning with validated speed. */
+	struct spi_mem_op max_read_op;
+	struct spi_mem_op max_write_op;
 
 	int (*select_target)(struct spinand_device *spinand,
 			     unsigned int target);
