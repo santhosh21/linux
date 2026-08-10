@@ -1284,6 +1284,7 @@ static int spinand_create_dirmap(struct spinand_device *spinand,
 	info.length = nanddev_page_size(nand) + nanddev_per_page_oobsize(nand);
 	info.primary_op_tmpl = *spinand->op_templates->update_cache;
 	info.primary_op_tmpl.data.ecc = enable_ecc;
+	info.primary_op_tmpl.max_freq = spinand->max_write_op.max_freq;
 	desc = devm_spi_mem_dirmap_create(&spinand->spimem->spi->dev,
 					  spinand->spimem, &info);
 	if (IS_ERR(desc))
@@ -1294,9 +1295,11 @@ static int spinand_create_dirmap(struct spinand_device *spinand,
 	/* Read descriptor */
 	info.primary_op_tmpl = *spinand->op_templates->read_cache;
 	info.primary_op_tmpl.data.ecc = enable_ecc;
+	info.primary_op_tmpl.max_freq = spinand->max_read_op.max_freq;
 	if (secondary_op) {
 		info.secondary_op_tmpl = *spinand->op_templates->cont_read_cache;
 		info.secondary_op_tmpl.data.ecc = enable_ecc;
+		info.secondary_op_tmpl.max_freq = spinand->max_read_op.max_freq;
 	}
 	desc = spinand_create_rdesc(spinand, &info);
 	if (IS_ERR(desc))
@@ -1543,21 +1546,50 @@ static int spinand_init_odtr_instruction_set(struct spinand_device *spinand)
 }
 
 /*
+ * spinand_op_shape_matches() - Check whether two ops share the same protocol
+ *				 shape.
+ * @a: first op
+ * @b: second op
+ *
+ * Compares cmd/addr/data buswidth, addr.nbytes, and DTR-ness, ignoring
+ * dummy cycle count and address value. A continuous-read op and its
+ * corresponding read_cache op are expected to differ only in those ignored
+ * fields: continuous read typically needs fewer dummy cycles, and always
+ * targets an internally tracked address rather than the caller's.
+ */
+static bool spinand_op_shape_matches(const struct spi_mem_op *a,
+				     const struct spi_mem_op *b)
+{
+	return a->cmd.buswidth == b->cmd.buswidth &&
+	       a->cmd.dtr == b->cmd.dtr &&
+	       a->addr.nbytes == b->addr.nbytes &&
+	       a->addr.buswidth == b->addr.buswidth &&
+	       a->addr.dtr == b->addr.dtr &&
+	       a->data.buswidth == b->data.buswidth &&
+	       a->data.dtr == b->data.dtr;
+}
+
+/*
  * spinand_op_find_best_variant() - Find the fastest eligible op variant.
- * @spinand:    SPI NAND device
- * @variants:   full variant list to search
- * @iface:      bus interface to consider (ODTR or SSDR)
- * @skip_mask:  bitmask of variant indices to skip (already tried)
+ * @spinand:     SPI NAND device
+ * @variants:    full variant list to search
+ * @iface:       bus interface to consider (ODTR or SSDR)
+ * @skip_mask:   bitmask of variant indices to skip (already tried)
+ * @match_shape: if non-NULL, only consider variants whose protocol shape
+ *		 (see spinand_op_shape_matches()) matches this op
  *
  * Iterates @variants, evaluates transfer duration for each eligible op, and
  * returns a pointer to the fastest one not in @skip_mask.  Returns NULL when
- * no eligible variant remains.  Used by both variant selection at init time
- * (skip_mask == 0) and ranked PHY tuning iteration.
+ * no eligible variant remains.  Used by variant selection at init time
+ * (skip_mask == 0, match_shape == NULL), ranked PHY tuning iteration
+ * (match_shape == NULL), and continuous-read counterpart lookup
+ * (match_shape == the read_cache op just selected).
  */
 static const struct spi_mem_op *
 spinand_op_find_best_variant(struct spinand_device *spinand,
 			     const struct spinand_op_variants *variants,
-			     enum spinand_bus_interface iface, u32 skip_mask)
+			     enum spinand_bus_interface iface, u32 skip_mask,
+			     const struct spi_mem_op *match_shape)
 {
 	struct nand_device *nand = spinand_to_nand(spinand);
 	const struct spi_mem_op *best_variant = NULL;
@@ -1572,6 +1604,10 @@ spinand_op_find_best_variant(struct spinand_device *spinand,
 
 		if ((skip_mask & BIT(i)) ||
 		    spinand_op_is_odtr(&variants->ops[i]) != (iface == ODTR))
+			continue;
+
+		if (match_shape &&
+		    !spinand_op_shape_matches(&variants->ops[i], match_shape))
 			continue;
 
 		op = variants->ops[i];
@@ -1608,7 +1644,37 @@ spinand_select_op_variant(struct spinand_device *spinand,
 			  enum spinand_bus_interface iface,
 			  const struct spinand_op_variants *variants)
 {
-	return spinand_op_find_best_variant(spinand, variants, iface, 0);
+	return spinand_op_find_best_variant(spinand, variants, iface, 0, NULL);
+}
+
+/*
+ * spinand_find_cont_read_variant() - Find the continuous-read counterpart of
+ *				       a chosen read_cache variant.
+ * @spinand: SPI NAND device
+ * @read_op: the read_cache op that was just selected
+ * @iface:   bus interface @read_op belongs to (ODTR or SSDR)
+ *
+ * Devices that implement continuous read via a distinct op template (rather
+ * than a mode toggle around the existing read_cache op) need that template
+ * re-paired whenever a different read_cache variant is selected, since the
+ * two are not guaranteed to sit at the same index in their respective
+ * variant tables (some devices omit continuous-read counterparts for
+ * specific dummy-cycle sub-variants, shifting every later index out of
+ * alignment). Matching by protocol shape instead of index is unaffected by
+ * such gaps. Returns NULL if this device has no continuous-read variant
+ * table, or no matching variant is eligible on this controller.
+ */
+static const struct spi_mem_op *
+spinand_find_cont_read_variant(struct spinand_device *spinand,
+			       const struct spi_mem_op *read_op,
+			       enum spinand_bus_interface iface)
+{
+	if (!spinand->all_cont_read_variants)
+		return NULL;
+
+	return spinand_op_find_best_variant(spinand,
+					    spinand->all_cont_read_variants,
+					    iface, 0, read_op);
 }
 
 /**
@@ -1743,6 +1809,20 @@ int spinand_match_and_init(struct spinand_device *spinand,
 				spinand->odtr_op_templates.cont_read_cache = op;
 			else
 				spinand->cont_read_possible = false;
+		}
+
+		/*
+		 * Save the full read variant list (ODTR and SSDR ops) for
+		 * ranked controller optimization. Only saved when all ODTR
+		 * templates are valid; spinand_optimize_controller() uses this
+		 * to fall back to the next-best variant when needed.
+		 */
+		if (spinand->odtr_op_templates.read_cache &&
+		    spinand->odtr_op_templates.write_cache &&
+		    spinand->odtr_op_templates.update_cache) {
+			spinand->all_read_variants = info->op_variants.read_cache;
+			spinand->all_cont_read_variants =
+				info->op_variants.cont_read_cache;
 		}
 
 		return 0;
@@ -1923,7 +2003,6 @@ static int spinand_mtd_suspend(struct mtd_info *mtd)
 
 static int spinand_init(struct spinand_device *spinand)
 {
-	struct device *dev = &spinand->spimem->spi->dev;
 	struct mtd_info *mtd = spinand_to_mtd(spinand);
 	struct nand_device *nand = mtd_to_nanddev(mtd);
 	int ret;
@@ -2015,14 +2094,6 @@ static int spinand_init(struct spinand_device *spinand)
 	mtd->ecc_step_size = nanddev_get_ecc_conf(nand)->step_size;
 	mtd->bitflip_threshold = DIV_ROUND_UP(mtd->ecc_strength * 3, 4);
 
-	ret = spinand_create_dirmaps(spinand);
-	if (ret) {
-		dev_err(dev,
-			"Failed to create direct mappings for read/write operations (err = %d)\n",
-			ret);
-		goto err_cleanup_ecc_engine;
-	}
-
 	return 0;
 
 err_cleanup_ecc_engine:
@@ -2051,6 +2122,198 @@ static void spinand_cleanup(struct spinand_device *spinand)
 	kfree(spinand->scratchbuf);
 }
 
+/*
+ * spinand_try_ranked_variant() - Try controller optimization on variants in
+ *				  performance order.
+ * @spinand:    SPI NAND device
+ * @mem:        SPI memory device
+ * @iface:      bus interface to iterate (ODTR or SSDR)
+ * @tried_mask: bitmask of already-tried variant indices; updated on each try
+ *
+ * Iterates the full read variant list in descending performance order,
+ * skipping variants in @tried_mask, and calls execute_tuning on each until
+ * one succeeds. Ranked iteration finds the best available variant without
+ * re-trying already-attempted ones.
+ *
+ * On success, sets spinand->max_read_op and updates the matching
+ * odtr_op_templates.read_cache or ssdr_op_templates.read_cache. For devices
+ * with a distinct cont_read_cache variant table (non-NULL
+ * all_cont_read_variants), re-pairs cont_read_cache via protocol-shape
+ * matching and updates cont_read_possible. Mode-toggle devices
+ * (all_cont_read_variants == NULL) are unaffected.
+ */
+static bool spinand_try_ranked_variant(struct spinand_device *spinand,
+				       struct spi_mem *mem,
+				       enum spinand_bus_interface iface,
+				       u32 *tried_mask)
+{
+	const struct spinand_op_variants *variants = spinand->all_read_variants;
+	struct spinand_mem_ops *templates = iface == ODTR ?
+		&spinand->odtr_op_templates : &spinand->ssdr_op_templates;
+	const struct spi_mem_op *best;
+	int ret;
+
+	if (!variants)
+		return false;
+
+	while ((best = spinand_op_find_best_variant(spinand, variants, iface,
+						    *tried_mask, NULL))) {
+		*tried_mask |= BIT(best - variants->ops);
+		spinand->max_read_op = *best;
+		spinand->max_read_op.max_freq = 0;
+		spinand->max_write_op.max_freq = 0;
+		ret = spi_mem_execute_tuning(mem, &spinand->max_read_op,
+					     &spinand->max_write_op);
+		if (ret && ret != -EOPNOTSUPP)
+			dev_dbg(&mem->spi->dev, "%s optimization failed: %d\n",
+				iface == ODTR ? "ODTR" : "SSDR", ret);
+		if (!ret && spinand->max_read_op.max_freq) {
+			templates->read_cache = best;
+			if (spinand->all_cont_read_variants) {
+				templates->cont_read_cache =
+					spinand_find_cont_read_variant(spinand, best, iface);
+				spinand->cont_read_possible =
+					!!templates->cont_read_cache;
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * spinand_reset_max_freq_ops() - Copy op templates and zero max_freq on both.
+ * @spinand:    SPI NAND device
+ * @templates:  op template set to copy from
+ *
+ * Called before execute_tuning so max_freq starts at zero; execute_tuning sets
+ * it to the validated clock rate only on success. A non-zero max_freq means
+ * controller-optimized; zero means the base rate applies.
+ */
+static void spinand_reset_max_freq_ops(struct spinand_device *spinand,
+				       struct spinand_mem_ops *templates)
+{
+	spinand->max_read_op = *templates->read_cache;
+	spinand->max_read_op.max_freq = 0;
+	spinand->max_write_op = *templates->write_cache;
+	spinand->max_write_op.max_freq = 0;
+}
+
+/*
+ * spinand_optimize_controller() - Negotiate the optimal controller operating
+ *				   point for the SPI NAND device.
+ * @spinand:    SPI NAND device
+ * @mem:        SPI memory device
+ *
+ * Tries the pre-selected variant first.  If the controller signals that
+ * optimization is not applicable for that specific op, iterates all remaining
+ * variants in performance order.  For devices that support both DTR and SDR
+ * interfaces, DTR variants are tried first; if all fail the device is
+ * switched to SDR mode and SDR variants are tried.  On full failure the
+ * device falls back to the best available non-optimized mode.  Devices that
+ * support only SDR skip the DTR ranked pass entirely.
+ *
+ * Optimization failure is never fatal.
+ *
+ * Note: tried_mask is u32, supporting up to 32 variants total across both
+ * ODTR and SSDR. Flash devices with more than 32 read variants are not
+ * supported.
+ */
+static void spinand_optimize_controller(struct spinand_device *spinand,
+					struct spi_mem *mem)
+{
+	u32 tried_mask;
+	int ret;
+
+	/* Skip entirely when no post-config target is configured. */
+	if (!mem->spi->post_config_max_speed_hz)
+		return;
+
+	spinand_reset_max_freq_ops(spinand, spinand->op_templates);
+
+	ret = spi_mem_execute_tuning(mem, &spinand->max_read_op,
+				     &spinand->max_write_op);
+	if (ret && ret != -EOPNOTSUPP)
+		dev_dbg(&mem->spi->dev, "Controller optimization failed: %d\n",
+			ret);
+
+	/*
+	 * Any non-zero return or a set max_freq means we are done (error,
+	 * unsupported, or success). Fallback only for the op-specific "skip"
+	 * signal: ret == 0 with max_freq still 0.
+	 */
+	if (ret || spinand->max_read_op.max_freq)
+		return;
+
+	/* SSDR-only devices have no ranked ODTR fallback available. */
+	if (spinand->bus_iface == SSDR || !spinand->all_read_variants)
+		return;
+
+	if (WARN_ON(spinand->all_read_variants->nops > 32))
+		return;
+
+	/* Mark the pre-selected ODTR variant as already tried. */
+	tried_mask = BIT(spinand->odtr_op_templates.read_cache -
+			 spinand->all_read_variants->ops);
+
+	dev_dbg(&mem->spi->dev,
+		"Optimization skipped for current op; searching for best variant\n");
+
+	/* Pass 1: try all remaining ODTR variants in performance order. */
+	if (spinand_try_ranked_variant(spinand, mem, ODTR, &tried_mask))
+		return;
+
+	/*
+	 * Pass 2: switch to SSDR and try all SSDR variants in performance
+	 * order. configure_chip is guaranteed non-NULL here: reaching ODTR
+	 * mode requires it.
+	 */
+	if (WARN_ON(!spinand->configure_chip))
+		goto use_odtr_fallback;
+
+	if (spinand->configure_chip(spinand, SSDR))
+		goto use_odtr_fallback;
+
+	spinand->op_templates = &spinand->ssdr_op_templates;
+	spinand->bus_iface = SSDR;
+	spinand->max_write_op = *spinand->ssdr_op_templates.write_cache;
+	spinand->max_write_op.max_freq = 0;
+
+	/*
+	 * Only ODTR variants were candidates in Pass 1; SSDR bits are clear.
+	 * Clear ODTR templates on success so spinand_configure_chip() on
+	 * resume does not re-enter ODTR with mismatched SSDR dirmaps.
+	 */
+	if (spinand_try_ranked_variant(spinand, mem, SSDR, &tried_mask)) {
+		spinand->odtr_op_templates.read_cache = NULL;
+		spinand->odtr_op_templates.write_cache = NULL;
+		spinand->odtr_op_templates.update_cache = NULL;
+		return;
+	}
+
+	/*
+	 * All attempts exhausted.  Revert to ODTR for non-optimized DTR
+	 * operation.  If revert fails, stay in SSDR — a mode mismatch
+	 * (ODTR op templates on SSDR-mode device) would corrupt data.
+	 * Clear ODTR templates in either case to prevent resume from
+	 * re-entering ODTR with mismatched SSDR dirmaps.
+	 */
+	if (spinand->configure_chip(spinand, ODTR)) {
+		dev_warn(&mem->spi->dev,
+			 "Failed to revert to ODTR, staying in SSDR\n");
+		spinand->odtr_op_templates.read_cache = NULL;
+		spinand->odtr_op_templates.write_cache = NULL;
+		spinand->odtr_op_templates.update_cache = NULL;
+		spinand_reset_max_freq_ops(spinand, &spinand->ssdr_op_templates);
+		return;
+	}
+
+use_odtr_fallback:
+	spinand->op_templates = &spinand->odtr_op_templates;
+	spinand->bus_iface = ODTR;
+	spinand_reset_max_freq_ops(spinand, &spinand->odtr_op_templates);
+}
+
 static int spinand_probe(struct spi_mem *mem)
 {
 	struct spinand_device *spinand;
@@ -2072,6 +2335,20 @@ static int spinand_probe(struct spi_mem *mem)
 	ret = spinand_init(spinand);
 	if (ret)
 		return ret;
+
+	/*
+	 * Negotiate the best controller operating point before creating dirmaps
+	 * so the validated frequency is available at dirmap construction time.
+	 */
+	spinand_optimize_controller(spinand, mem);
+
+	ret = spinand_create_dirmaps(spinand);
+	if (ret) {
+		dev_err(&mem->spi->dev,
+			"Failed to create direct mappings for read/write operations (err = %d)\n",
+			ret);
+		goto err_spinand_cleanup;
+	}
 
 	ret = mtd_device_register(mtd, NULL, 0);
 	if (ret)
