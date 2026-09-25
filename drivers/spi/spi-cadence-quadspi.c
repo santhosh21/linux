@@ -6,6 +6,7 @@
 // Copyright Intel Corporation (C) 2019-2020. All rights reserved.
 // Copyright (C) 2020 Texas Instruments Incorporated - http://www.ti.com
 
+#include <linux/bitfield.h>
 #include <linux/clk.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
@@ -1075,6 +1076,105 @@ re_enable:
 	return ret;
 }
 
+static int cqspi_phy_reprogram_dll(struct cqspi_flash_pdata *f_pdata)
+{
+	struct cqspi_st *cqspi = f_pdata->cqspi;
+	void __iomem *reg_base = cqspi->iobase;
+	unsigned int reg;
+	int ret;
+
+	/* CQSPI_REG_PHY_CONFIG is global; resync if it doesn't match this CS. */
+	reg = readl(reg_base + CQSPI_REG_PHY_CONFIG);
+	if (!f_pdata->dll_locked ||
+	    ((reg >> CQSPI_REG_PHY_CONFIG_RX_DEL_LSB) &
+	     CQSPI_REG_PHY_CONFIG_RX_DEL_MASK) != f_pdata->phy_setting.rx ||
+	    ((reg >> CQSPI_REG_PHY_CONFIG_TX_DEL_LSB) &
+	     CQSPI_REG_PHY_CONFIG_TX_DEL_MASK) != f_pdata->phy_setting.tx) {
+		cqspi_set_dll(reg_base, f_pdata->phy_setting.rx,
+			      f_pdata->phy_setting.tx);
+		ret = cqspi_resync_dll(cqspi);
+		if (ret) {
+			f_pdata->dll_locked = false;
+			return ret;
+		}
+		f_pdata->dll_locked = true;
+	}
+	return 0;
+}
+
+static void cqspi_phy_restore_read_config(struct cqspi_flash_pdata *f_pdata)
+{
+	struct cqspi_st *cqspi = f_pdata->cqspi;
+	void __iomem *reg_base = cqspi->iobase;
+	unsigned int reg;
+
+	/* Shared by the disable path and the failed-enable rollback. */
+	cqspi_readdata_capture(cqspi, !cqspi->rclk_en, false,
+			       f_pdata->read_delay);
+
+	reg = readl(reg_base + CQSPI_REG_CONFIG);
+	reg &= ~(CQSPI_REG_CONFIG_PHY_EN | CQSPI_REG_CONFIG_PHY_PIPELINE);
+	writel(reg, reg_base + CQSPI_REG_CONFIG);
+
+	reg = readl(reg_base + CQSPI_REG_RD_INSTR);
+	reg &= ~(CQSPI_REG_RD_INSTR_DUMMY_MASK << CQSPI_REG_RD_INSTR_DUMMY_LSB);
+	reg |= FIELD_PREP(CQSPI_REG_RD_INSTR_DUMMY_MASK
+				  << CQSPI_REG_RD_INSTR_DUMMY_LSB,
+			  cqspi->phy_saved_dummy);
+	writel(reg, reg_base + CQSPI_REG_RD_INSTR);
+}
+
+static int cqspi_tune_phy_read(struct cqspi_flash_pdata *f_pdata, bool enable)
+{
+	struct cqspi_st *cqspi = f_pdata->cqspi;
+	void __iomem *reg_base = cqspi->iobase;
+	u32 reg;
+	u8 dummy;
+	int ret;
+
+	/* Wait for idle before touching CONFIG/RD_INSTR either direction. */
+	ret = cqspi_wait_idle(cqspi);
+	if (ret)
+		return ret;
+
+	if (!enable) {
+		cqspi_phy_restore_read_config(f_pdata);
+		return 0;
+	}
+
+	ret = cqspi_phy_reprogram_dll(f_pdata);
+	if (ret)
+		return ret;
+
+	cqspi_readdata_capture(cqspi, !f_pdata->use_dqs, f_pdata->use_dqs,
+			       f_pdata->phy_setting.read_delay);
+
+	reg = readl(reg_base + CQSPI_REG_CONFIG);
+	reg |= CQSPI_REG_CONFIG_PHY_EN | CQSPI_REG_CONFIG_PHY_PIPELINE;
+	writel(reg, reg_base + CQSPI_REG_CONFIG);
+
+	/* PHY pipeline adds one cycle of latency; save count, then reduce it. */
+	reg = readl(reg_base + CQSPI_REG_RD_INSTR);
+	dummy = FIELD_GET(CQSPI_REG_RD_INSTR_DUMMY_MASK
+				  << CQSPI_REG_RD_INSTR_DUMMY_LSB,
+			  reg);
+	cqspi->phy_saved_dummy = dummy;
+	if (dummy)
+		dummy--;
+	reg &= ~(CQSPI_REG_RD_INSTR_DUMMY_MASK
+		 << CQSPI_REG_RD_INSTR_DUMMY_LSB);
+	reg |= FIELD_PREP(CQSPI_REG_RD_INSTR_DUMMY_MASK
+				  << CQSPI_REG_RD_INSTR_DUMMY_LSB,
+			  dummy);
+	writel(reg, reg_base + CQSPI_REG_RD_INSTR);
+
+	ret = cqspi_wait_idle(cqspi);
+	if (ret)
+		cqspi_phy_restore_read_config(f_pdata);
+
+	return ret;
+}
+
 static int cqspi_versal_indirect_read_dma(struct cqspi_flash_pdata *f_pdata,
 					  u_char *rxbuf, loff_t from_addr,
 					  size_t n_rx)
@@ -1493,6 +1593,14 @@ static void cqspi_configure(struct cqspi_flash_pdata *f_pdata,
 		cqspi_controller_enable(cqspi, 1);
 }
 
+static bool cqspi_use_tuned_phy(struct cqspi_flash_pdata *f_pdata,
+				const struct spi_mem_op *op,
+				u32 post_config_max_speed_hz)
+{
+	return f_pdata->use_tuned_phy &&
+	       op->max_freq == post_config_max_speed_hz;
+}
+
 static ssize_t cqspi_write(struct cqspi_flash_pdata *f_pdata,
 			   const struct spi_mem_op *op)
 {
@@ -1622,26 +1730,66 @@ static void cqspi_memcpy_fromio(const struct spi_mem_op *op, void *to,
 	memcpy_fromio(to, from, count);
 }
 
+static int cqspi_direct_read_fallback(struct cqspi_flash_pdata *f_pdata,
+				      const struct spi_mem_op *op,
+				      unsigned long max_speed_hz,
+				      u32 post_config_max_speed_hz)
+{
+	struct cqspi_st *cqspi = f_pdata->cqspi;
+	loff_t from = op->addr.val;
+	size_t len = op->data.nbytes;
+	u_char *buf = op->data.buf.in;
+	unsigned long configured_sclk = cqspi->sclk;
+	bool reclock = op->max_freq == post_config_max_speed_hz &&
+		       configured_sclk != max_speed_hz;
+	int ret = 0;
+
+	/* Drop to the safe rate for this untuned transfer; PHY isn't used. */
+	if (reclock)
+		cqspi_configure(f_pdata, max_speed_hz);
+
+	if (!cqspi->rx_chan || !virt_addr_valid(buf) ||
+	    len < CQSPI_PHY_MIN_DIRECT_READ_LEN)
+		cqspi_memcpy_fromio(op, buf, cqspi->ahb_base + from, len);
+	else
+		ret = cqspi_direct_read_dma(f_pdata, buf, from, len);
+
+	if (reclock)
+		cqspi_configure(f_pdata, configured_sclk);
+
+	return ret;
+}
+
 static int cqspi_direct_read_execute(struct cqspi_flash_pdata *f_pdata,
 				     const struct spi_mem_op *op,
+				     unsigned long max_speed_hz,
 				     u32 post_config_max_speed_hz)
 {
 	struct cqspi_st *cqspi = f_pdata->cqspi;
 	loff_t from = op->addr.val;
 	size_t len = op->data.nbytes;
 	u_char *buf = op->data.buf.in;
+	int ret;
 
-	if (!cqspi->rx_chan || !virt_addr_valid(buf) ||
-	    len < CQSPI_PHY_MIN_DIRECT_READ_LEN) {
-		cqspi_memcpy_fromio(op, buf, cqspi->ahb_base + from, len);
-		return 0;
-	}
+	if (!cqspi_use_tuned_phy(f_pdata, op, post_config_max_speed_hz) ||
+	    !cqspi->rx_chan || !virt_addr_valid(buf) ||
+	    len < CQSPI_PHY_MIN_DIRECT_READ_LEN ||
+	    !IS_ALIGNED(from, 16) || !IS_ALIGNED(from + len, 16))
+		return cqspi_direct_read_fallback(f_pdata, op, max_speed_hz,
+						  post_config_max_speed_hz);
 
-	return cqspi_direct_read_dma(f_pdata, buf, from, len);
+	ret = cqspi_tune_phy_read(f_pdata, true);
+	if (ret)
+		return ret;
+	ret = cqspi_direct_read_dma(f_pdata, buf, from, len);
+	ret = cqspi_tune_phy_read(f_pdata, false) ?: ret;
+
+	return ret;
 }
 
 static ssize_t cqspi_read(struct cqspi_flash_pdata *f_pdata,
 			  const struct spi_mem_op *op,
+			  unsigned long max_speed_hz,
 			  u32 post_config_max_speed_hz)
 {
 	struct cqspi_st *cqspi = f_pdata->cqspi;
@@ -1658,8 +1806,13 @@ static ssize_t cqspi_read(struct cqspi_flash_pdata *f_pdata,
 
 	if ((cqspi->use_direct_mode && ((from + len) <= cqspi->ahb_size)) ||
 	    (cqspi->ddata && cqspi->ddata->quirks & CQSPI_NO_INDIRECT_MODE))
-		return cqspi_direct_read_execute(f_pdata, op,
+		return cqspi_direct_read_execute(f_pdata, op, max_speed_hz,
 						 post_config_max_speed_hz);
+
+	/* Indirect mode has no PHY support; never run it at the tuned rate. */
+	if (op->max_freq == post_config_max_speed_hz &&
+	    cqspi->sclk != max_speed_hz)
+		cqspi_configure(f_pdata, max_speed_hz);
 
 	if (cqspi->use_dma_read && ddata && ddata->indirect_read_dma &&
 	    virt_addr_valid(buf) && ((dma_align & CQSPI_DMA_UNALIGN) == 0))
@@ -1672,22 +1825,32 @@ static int cqspi_mem_process(struct spi_mem *mem, const struct spi_mem_op *op)
 {
 	struct cqspi_st *cqspi = spi_controller_get_devdata(mem->spi->controller);
 	struct cqspi_flash_pdata *f_pdata;
-
-	f_pdata = &cqspi->f_pdata[spi_get_chipselect(mem->spi, 0)];
-	cqspi_configure(f_pdata, op->max_freq);
-
-	if (op->data.dir == SPI_MEM_DATA_IN && op->data.buf.in) {
+	unsigned long sclk = op->max_freq;
+	bool is_read = op->data.dir == SPI_MEM_DATA_IN && op->data.buf.in;
 	/*
 	 * Performing reads in DAC mode forces to read minimum 4 bytes
 	 * which is unsupported on some flash devices during register
 	 * reads, prefer STIG mode for such small reads.
 	 */
-		if (!op->addr.nbytes ||
-		    (op->data.nbytes <= CQSPI_STIG_DATA_LEN_MAX &&
-		     !cqspi->disable_stig_mode))
+	bool use_stig = is_read &&
+			(!op->addr.nbytes ||
+			 (op->data.nbytes <= CQSPI_STIG_DATA_LEN_MAX &&
+			  !cqspi->disable_stig_mode));
+
+	f_pdata = &cqspi->f_pdata[spi_get_chipselect(mem->spi, 0)];
+
+	/* Tuning inactive, or STIG (no PHY handling of its own): use safe rate. */
+	if (sclk == mem->spi->post_config_max_speed_hz &&
+	    (!f_pdata->use_tuned_phy || use_stig))
+		sclk = mem->spi->max_speed_hz;
+
+	cqspi_configure(f_pdata, sclk);
+
+	if (is_read) {
+		if (use_stig)
 			return cqspi_command_read(f_pdata, op);
 
-		return cqspi_read(f_pdata, op,
+		return cqspi_read(f_pdata, op, mem->spi->max_speed_hz,
 				  mem->spi->post_config_max_speed_hz);
 	}
 
