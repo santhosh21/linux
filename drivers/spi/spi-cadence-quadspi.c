@@ -1620,8 +1620,9 @@ static void cqspi_configure(struct cqspi_flash_pdata *f_pdata,
 	struct cqspi_st *cqspi = f_pdata->cqspi;
 	int switch_cs = (cqspi->current_cs != f_pdata->cs);
 	int switch_ck = (cqspi->sclk != sclk);
+	bool reconfigure = switch_cs || switch_ck;
 
-	if (switch_cs || switch_ck)
+	if (reconfigure)
 		cqspi_controller_enable(cqspi, 0);
 
 	/* Switch chip select. */
@@ -1630,17 +1631,26 @@ static void cqspi_configure(struct cqspi_flash_pdata *f_pdata,
 		cqspi_chipselect(f_pdata);
 	}
 
-	/* Setup baudrate divisor and delays */
+	/* Update baudrate only on clock change. */
 	if (switch_ck) {
 		cqspi->sclk = sclk;
 		cqspi_config_baudrate_div(cqspi);
+	}
+
+	/*
+	 * Reprogram per-device CS timing and non-PHY read capture on any
+	 * chip-select or clock switch. Without this, two devices at the same
+	 * frequency would each see the other's timing parameters after a CS
+	 * switch, since the lazy clock-only check would never trigger.
+	 */
+	if (reconfigure) {
 		cqspi_delay(f_pdata);
 		if (!cqspi->phy_tuning_active)
 			cqspi_readdata_capture(cqspi, !cqspi->rclk_en, false,
 					       f_pdata->read_delay);
 	}
 
-	if (switch_cs || switch_ck)
+	if (reconfigure)
 		cqspi_controller_enable(cqspi, 1);
 }
 
