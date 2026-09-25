@@ -754,6 +754,15 @@ struct spinand_mem_ops {
  * @odtr_op_templates: Templates for all octal DTR SPI mem operations
  * @op_templates: Templates for all SPI mem operations
  * @bus_iface: Current bus interface
+ * @all_read_variants: Full read variant list (ODTR and SSDR ops together),
+ *		       saved when ODTR templates are valid. Used for ranked
+ *		       controller-optimization fallback
+ * @all_cont_read_variants: Continuous-read counterpart of
+ *			    @all_read_variants, if any
+ * @max_read_op: Persistent read op template updated by execute_tuning with
+ *		 the validated operating speed
+ * @max_write_op: Persistent write op template updated by execute_tuning with
+ *		  the validated operating speed
  * @select_target: select a specific target/die. Usually called before sending
  *		   a command addressing a page or an eraseblock embedded in
  *		   this die. Only required if your chip exposes several dies
@@ -793,7 +802,13 @@ struct spinand_device {
 	struct spinand_mem_ops *op_templates;
 	enum spinand_bus_interface bus_iface;
 
+	const struct spinand_op_variants *all_read_variants;
+	const struct spinand_op_variants *all_cont_read_variants;
+
 	struct spinand_dirmap *dirmaps;
+
+	struct spi_mem_op max_read_op;
+	struct spi_mem_op max_write_op;
 
 	int (*select_target)(struct spinand_device *spinand,
 			     unsigned int target);
