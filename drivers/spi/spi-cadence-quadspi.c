@@ -4083,7 +4083,7 @@ static int cqspi_runtime_suspend(struct device *dev)
 static int cqspi_runtime_resume(struct device *dev)
 {
 	struct cqspi_st *cqspi = dev_get_drvdata(dev);
-	int ret;
+	int cs, ret;
 
 	ret = clk_bulk_prepare_enable(CLK_QSPI_NUM, cqspi->clks);
 	if (ret)
@@ -4096,6 +4096,31 @@ static int cqspi_runtime_resume(struct device *dev)
 
 	cqspi->current_cs = -1;
 	cqspi->sclk = 0;
+
+	for (cs = 0; cs < CQSPI_MAX_CHIPSELECT; cs++) {
+		if (cqspi->f_pdata[cs].use_tuned_phy)
+			break;
+	}
+	if (cs == CQSPI_MAX_CHIPSELECT)
+		return 0;
+
+	/* PHY_DLL_MASTER and PHY_CONFIG are global; resync once, not per-CS. */
+	cqspi_phy_set_dll_master(cqspi);
+	ret = cqspi_resync_dll(cqspi);
+	if (ret)
+		dev_warn(dev, "PHY DLL resync failed on resume: %d, disabling PHY\n", ret);
+
+	for (; cs < CQSPI_MAX_CHIPSELECT; cs++) {
+		struct cqspi_flash_pdata *f_pdata = &cqspi->f_pdata[cs];
+
+		if (!f_pdata->use_tuned_phy)
+			continue;
+
+		f_pdata->dll_locked = false;
+		if (ret)
+			f_pdata->use_tuned_phy = false;
+	}
+
 	return 0;
 }
 
