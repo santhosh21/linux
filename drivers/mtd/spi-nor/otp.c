@@ -39,6 +39,7 @@ int spi_nor_otp_read_secr(struct spi_nor *nor, loff_t addr, size_t len, u8 *buf)
 	u8 addr_nbytes, read_opcode, read_dummy;
 	struct spi_mem_dirmap_desc *rdesc;
 	enum spi_nor_protocol read_proto;
+	unsigned int max_read_op_freq;
 	int ret;
 
 	read_opcode = nor->read_opcode;
@@ -46,11 +47,14 @@ int spi_nor_otp_read_secr(struct spi_nor *nor, loff_t addr, size_t len, u8 *buf)
 	read_dummy = nor->read_dummy;
 	read_proto = nor->read_proto;
 	rdesc = nor->dirmap.rdesc;
+	max_read_op_freq = nor->max_read_op.max_freq;
 
 	nor->read_opcode = SPINOR_OP_RSECR;
 	nor->read_dummy = 8;
 	nor->read_proto = SNOR_PROTO_1_1_1;
 	nor->dirmap.rdesc = NULL;
+	/* Security register uses an untuned 1-1-1 protocol; force base rate. */
+	nor->max_read_op.max_freq = 0;
 
 	ret = spi_nor_read_data(nor, addr, len, buf);
 
@@ -59,6 +63,7 @@ int spi_nor_otp_read_secr(struct spi_nor *nor, loff_t addr, size_t len, u8 *buf)
 	nor->read_dummy = read_dummy;
 	nor->read_proto = read_proto;
 	nor->dirmap.rdesc = rdesc;
+	nor->max_read_op.max_freq = max_read_op_freq;
 
 	return ret;
 }
