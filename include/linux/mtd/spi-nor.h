@@ -374,6 +374,8 @@ struct spi_nor_flash_parameter;
  *                      settings that can be overwritten by the spi_nor_fixups
  *                      hooks, or dynamically when parsing the SFDP tables.
  * @dirmap:		pointers to struct spi_mem_dirmap_desc for reads/writes.
+ * @max_read_op:	persistent read op template updated by execute_tuning
+ *			with the validated operating speed.
  * @priv:		pointer to the private data
  */
 struct spi_nor {
@@ -415,6 +417,8 @@ struct spi_nor {
 		struct spi_mem_dirmap_desc *rdesc;
 		struct spi_mem_dirmap_desc *wdesc;
 	} dirmap;
+
+	struct spi_mem_op max_read_op;
 
 	void *priv;
 };
